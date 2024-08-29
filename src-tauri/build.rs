@@ -1,36 +1,64 @@
 use core::panic;
-use pyo3_bindgen::Codegen;
-use quote::{quote, ToTokens};
+use quote::{format_ident, quote, ToTokens};
 use std::error::Error;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::Command;
 use syn::{
-    parse_file, AngleBracketedGenericArguments, GenericArgument, Item, PatIdent, PathArguments,
-    PathSegment, ReturnType, Type,
+    parse_file, AngleBracketedGenericArguments, GenericArgument, Ident, Item, ItemMod, PatIdent,
+    PathArguments, PathSegment, ReturnType, Type,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::env::set_var("PYTHONPATH", "./");
     std::env::set_var("PYTHONDONTWRITEBYTECODE", "1");
 
-    Codegen::default()
-        .module_name("src_py")
+    pyo3_bindgen::Codegen::default()
+        .module_name("python.src")
         .unwrap()
         .build("src/gen/py_bindings.rs")
         .unwrap();
 
+    generate_commands_from_py_bindings(
+        "src/gen/py_bindings.rs",
+        "src/gen/py_commands.rs",
+        vec!["python", "src"],
+    )
+    .expect("Failed to generate Tauri commands");
+
+    protobuf_codegen::Codegen::new()
+        .out_dir("src/gen/state")
+        .inputs(&["state.proto"])
+        .includes(&["."])
+        .run()
+        .expect("Failed to generate protobuf code");
+
+    gen_python_from_proto("state.proto", "python/src/gen", ".");
+
     format("src/gen/py_bindings.rs");
-
-    generate_commands_from_py_bindings("src/gen/py_bindings.rs", "src/gen/py_commands.rs")
-        .expect("Failed to generate Tauri commands");
-
     format("src/gen/py_commands.rs");
 
     tauri_build::build();
 
     Ok(())
+}
+
+fn gen_python_from_proto(file: &str, out_dir: &str, proto_path: &str) {
+    let output = Command::new("protoc")
+        .arg(format!("--proto_path={}", proto_path))
+        .arg(format!("--python_out={}", out_dir))
+        .arg(format!("--mypy_out={}", out_dir))
+        .arg(file)
+        .output()
+        .expect("Failed to execute protoc");
+
+    if !output.status.success() {
+        panic!(
+            "Failed to generate Python code from proto file: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 fn format(path: &str) {
@@ -49,75 +77,82 @@ fn format(path: &str) {
 fn generate_commands_from_py_bindings<P: AsRef<Path>>(
     input_path: P,
     output_path: P,
+    modules: Vec<&str>,
 ) -> Result<(), Box<dyn Error>> {
     // Read the input Rust file into a string
     let mut input_file = File::open(input_path)?;
     let mut input_code = String::new();
     input_file.read_to_string(&mut input_code)?;
+    let mut output_code = String::new();
 
     // Parse the input Rust code into a syntax tree
     let syntax_tree = parse_file(&input_code)?;
 
+    let module_idents: Vec<Ident> = modules.iter().map(|m| format_ident!("{}", m)).collect();
+
     // Generate the output code
-    let mut output_code = String::new();
 
     output_code.push_str(
         &quote! {
-         use crate::gen::py_bindings::src_py;
+         use crate::gen::py_bindings::#(#module_idents)::* as bindings;
         }
         .to_string(),
     );
 
-    // Process items in the syntax tree
-    for item in syntax_tree.items {
-        if let Item::Mod(item_mod) = item {
-            // Add use statement for the module
+    let mut modules_iter = modules.iter();
+    let first_mod_name = modules_iter.next().unwrap();
 
-            // Process items in the module
-            if let Some((_, items)) = item_mod.content {
-                for item in items {
-                    if let Item::Fn(func) = item {
-                        // Skip functions that don't match the expected pattern
-                        if func.sig.inputs.len() < 2 {
-                            continue;
-                        }
+    let first_mod = get_first_mod(syntax_tree, first_mod_name);
 
-                        // Extract function name, arguments, and return type
-                        let func_name = &func.sig.ident;
-                        let args = &func.sig.inputs;
-                        let mut args_iter = args.iter();
-                        let _ = args_iter.next(); // Skip the first argument
-                        let remaining_args: Vec<_> = args_iter.map(replace_prefix).collect();
+    let mut module = first_mod;
 
-                        let ret_type = match &func.sig.output {
-                            ReturnType::Type(_, ty) => extract_path_segment(*ty.clone()),
-                            ReturnType::Default => panic!("Function must have a return type"),
-                        };
+    for module_name in modules_iter {
+        module = get_tail_mod(&module, module_name);
+    }
 
-                        // Convert function arguments to appropriate quote format
-                        let args_list = remaining_args.iter().map(|arg| {
-                            let arg_name = match arg {
-                                syn::FnArg::Typed(pat_type) => &pat_type.pat,
-                                _ => panic!("Unexpected argument type"),
-                            };
-                            quote! { #arg_name }
-                        });
-
-                        // Build the transformed function
-                        let transformed_fn = quote! {
-                            #[tauri::command]
-                            pub fn #func_name(#(#remaining_args),*) -> Result<#ret_type, String> {
-                                pyo3::Python::with_gil(|py| {
-                                    src_py::#func_name(py, #(#args_list),*).map_err(|e| e.to_string())
-                                })
-                            }
-                        };
-
-                        // Append the transformed function to the output code
-                        output_code.push_str(&transformed_fn.to_string());
-                        output_code.push_str("\n\n");
-                    }
+    // Process items in the module
+    if let Some((_, items)) = module.clone().content {
+        for item in items {
+            if let Item::Fn(func) = item {
+                // Skip functions that don't match the expected pattern
+                if func.sig.inputs.len() < 2 {
+                    continue;
                 }
+
+                // Extract function name, arguments, and return type
+                let func_name = &func.sig.ident;
+                let args = &func.sig.inputs;
+                let mut args_iter = args.iter();
+                let _ = args_iter.next(); // Skip the first argument
+                let remaining_args: Vec<_> = args_iter.map(replace_prefix).collect();
+
+                let ret_type = match &func.sig.output {
+                    ReturnType::Type(_, ty) => extract_path_segment(*ty.clone()),
+                    ReturnType::Default => panic!("Function must have a return type"),
+                };
+
+                // Convert function arguments to appropriate quote format
+                let args_list = remaining_args.iter().map(|arg| {
+                    let arg_name = match arg {
+                        syn::FnArg::Typed(pat_type) => &pat_type.pat,
+                        _ => panic!("Unexpected argument type"),
+                    };
+                    quote! { #arg_name }
+                });
+
+                // Build the transformed function
+                let transformed_fn = quote! {
+                    #[tauri::command]
+                    pub fn #func_name(#(#remaining_args),*) -> Result<#ret_type, String> {
+                        pyo3::Python::with_gil(|py| {
+                            bindings::#func_name(py, #(#args_list),*).map_err(|e| e.to_string())
+                        })
+                    }
+                };
+
+                // Append the transformed function to the output code
+                output_code.push_str(&transformed_fn.to_string());
+                output_code.push_str("\n\n");
             }
         }
     }
@@ -127,6 +162,43 @@ fn generate_commands_from_py_bindings<P: AsRef<Path>>(
     output_file.write_all(output_code.as_bytes())?;
 
     Ok(())
+}
+
+fn get_tail_mod(module: &ItemMod, module_name: &&str) -> ItemMod {
+    module
+        .content
+        .as_ref()
+        .unwrap()
+        .1
+        .iter()
+        .find_map(|item| match item {
+            Item::Mod(item_mod) => {
+                if item_mod.ident == module_name {
+                    return Some(item_mod);
+                }
+                None
+            }
+            _ => None,
+        })
+        .unwrap()
+        .clone()
+}
+
+fn get_first_mod(syntax_tree: syn::File, first_mod_name: &str) -> syn::ItemMod {
+    syntax_tree
+        .items
+        .into_iter()
+        .find_map(|item| match item {
+            syn::Item::Mod(item_mod) => {
+                if item_mod.ident == first_mod_name {
+                    Some(item_mod)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+        .unwrap()
 }
 
 fn replace_prefix(arg: &syn::FnArg) -> syn::FnArg {

@@ -6,5 +6,7 @@
 # will have schema files for capabilities auto-completion
 /gen/schemas
 
+/python/src/gen/*
+!/python/src/gen/__init__.py
 /src/gen/*
 !/src/gen/mod.rs

@@ -1,6 +1,5 @@
 from typing import Optional
 
-
 def greet(name: str) -> str:
     return f"Hello, {name}! You have been greeted from Python!"
 
